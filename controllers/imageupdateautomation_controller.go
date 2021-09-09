@@ -43,6 +43,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	kuberecorder "k8s.io/client-go/tools/record"
 	"k8s.io/client-go/tools/reference"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -60,6 +61,7 @@ import (
 	"github.com/fluxcd/pkg/runtime/events"
 	"github.com/fluxcd/pkg/runtime/logger"
 	"github.com/fluxcd/pkg/runtime/metrics"
+	"github.com/fluxcd/pkg/runtime/patch"
 	"github.com/fluxcd/pkg/runtime/predicates"
 	sourcev1 "github.com/fluxcd/source-controller/api/v1beta1"
 	"github.com/fluxcd/source-controller/pkg/git"
@@ -102,7 +104,7 @@ type ImageUpdateAutomationReconcilerOptions struct {
 // +kubebuilder:rbac:groups=image.toolkit.fluxcd.io,resources=imageupdateautomations/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=source.toolkit.fluxcd.io,resources=gitrepositories,verbs=get;list;watch
 
-func (r *ImageUpdateAutomationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *ImageUpdateAutomationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, retErr error) {
 	log := logr.FromContext(ctx)
 	debuglog := log.V(logger.DebugLevel)
 	tracelog := log.V(logger.TraceLevel)
@@ -114,13 +116,23 @@ func (r *ImageUpdateAutomationReconciler) Reconcile(ctx context.Context, req ctr
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// record suspension metrics
-	defer r.recordSuspension(ctx, auto)
-
+	r.recordSuspension(ctx, auto)
 	if auto.Spec.Suspend {
 		log.Info("ImageUpdateAutomation is suspended, skipping automation run")
 		return ctrl.Result{}, nil
 	}
+
+	patcher, err := patch.NewHelper(&auto, r.Client)
+	if err != nil {
+		return ctrl.Result{Requeue: true}, err
+	}
+	defer func() {
+		if err := patcher.Patch(ctx, &auto, patch.WithOwnedConditions{
+			Conditions: []string{meta.ReadyCondition},
+		}, patch.WithStatusObservedGeneration{}); err != nil {
+			retErr = kerrors.NewAggregate([]error{retErr, err})
+		}
+	}()
 
 	templateValues.AutomationObject = req.NamespacedName
 
@@ -141,19 +153,12 @@ func (r *ImageUpdateAutomationReconciler) Reconcile(ctx context.Context, req ctr
 	// annotation if it's there
 	if token, ok := meta.ReconcileAnnotationValue(auto.GetAnnotations()); ok {
 		auto.Status.SetLastHandledReconcileRequest(token)
-
-		if err := r.patchStatus(ctx, req, auto.Status); err != nil {
-			return ctrl.Result{Requeue: true}, err
-		}
 	}
 
 	// failWithError is a helper for bailing on the reconciliation.
 	failWithError := func(err error) (ctrl.Result, error) {
 		r.event(ctx, auto, events.EventSeverityError, err.Error())
 		conditions.MarkFalse(&auto, meta.ReadyCondition, meta.FailedReason, err.Error())
-		if err := r.patchStatus(ctx, req, auto.Status); err != nil {
-			log.Error(err, "failed to reconcile")
-		}
 		return ctrl.Result{Requeue: true}, err
 	}
 
@@ -179,9 +184,6 @@ func (r *ImageUpdateAutomationReconciler) Reconcile(ctx context.Context, req ctr
 		if client.IgnoreNotFound(err) == nil {
 			conditions.MarkFalse(&auto, meta.ReadyCondition, imagev1.GitNotAvailableReason, "referenced git repository is missing")
 			log.Error(err, "referenced git repository does not exist")
-			if err := r.patchStatus(ctx, req, auto.Status); err != nil {
-				return ctrl.Result{Requeue: true}, err
-			}
 			return ctrl.Result{}, nil // and assume we'll hear about it when it arrives
 		}
 		return ctrl.Result{}, err
@@ -287,7 +289,7 @@ func (r *ImageUpdateAutomationReconciler) Reconcile(ctx context.Context, req ctr
 		// no sense rescheduling until this resource changes
 		r.event(ctx, auto, events.EventSeverityInfo, "no known update strategy in spec, failing trivially")
 		conditions.MarkFalse(&auto, meta.ReadyCondition, imagev1.NoStrategyReason, "no known update strategy is given for object")
-		return ctrl.Result{}, r.patchStatus(ctx, req, auto.Status)
+		return ctrl.Result{}, nil
 	}
 
 	debuglog.Info("ran updates to working dir", "working", tmp)
@@ -344,9 +346,6 @@ func (r *ImageUpdateAutomationReconciler) Reconcile(ctx context.Context, req ctr
 	// Getting to here is a successful run.
 	auto.Status.LastAutomationRunTime = &metav1.Time{Time: now}
 	conditions.MarkTrue(&auto, meta.ReadyCondition, meta.SucceededReason, statusMessage)
-	if err := r.patchStatus(ctx, req, auto.Status); err != nil {
-		return ctrl.Result{Requeue: true}, err
-	}
 
 	// We're either in this method because something changed, or this
 	// object got requeued. Either way, once successful, we don't need
@@ -377,21 +376,6 @@ func (r *ImageUpdateAutomationReconciler) SetupWithManager(mgr ctrl.Manager, opt
 			MaxConcurrentReconciles: opts.MaxConcurrentReconciles,
 		}).
 		Complete(r)
-}
-
-func (r *ImageUpdateAutomationReconciler) patchStatus(ctx context.Context,
-	req ctrl.Request,
-	newStatus imagev1.ImageUpdateAutomationStatus) error {
-
-	var auto imagev1.ImageUpdateAutomation
-	if err := r.Get(ctx, req.NamespacedName, &auto); err != nil {
-		return err
-	}
-
-	patch := client.MergeFrom(auto.DeepCopy())
-	auto.Status = newStatus
-
-	return r.Status().Patch(ctx, &auto, patch)
 }
 
 // intervalOrDefault gives the interval specified, or if missing, the default
