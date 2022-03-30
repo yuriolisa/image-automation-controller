@@ -94,7 +94,7 @@ RUN export $(cat build/musl/$(xx-info alpine-arch).env | xargs) && \
 # Ensure that the binary was cross-compiled correctly to the target platform.
 RUN xx-verify --static /image-automation-controller
 
-FROM registry.access.redhat.com/ubi8/ubi
+FROM registry.access.redhat.com/ubi8/ubi@sha256:56c374376a42da40f3aec753c4eab029b5ea162d70cb5f0cda24758780c31d81
 
 ARG TARGETPLATFORM
 RUN yum install -y ca-certificates 
@@ -102,6 +102,7 @@ RUN yum install -y ca-certificates
 # Copy over binary from build
 COPY --from=build /image-automation-controller /usr/local/bin/
 COPY ATTRIBUTIONS.md /
+COPY LICENSE /licenses/LICENSE
 
 USER 65534:65534
 ENTRYPOINT [ "image-automation-controller" ]
